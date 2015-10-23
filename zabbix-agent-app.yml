@@ -1,0 +1,244 @@
+application:
+  configuration:
+    input.image: { ami: "us-east-1/ami-8997afe0", user: "root", type: "linux", hw: "m1.small" }
+    input.windows-password: "qwerty12!"
+    input.instance-prefix: "SomeApp"
+  interfaces:
+    input:
+      image: bind(vm#input.image)
+      instance-prefix: bind(vm#input.instance-prefix)
+      windows-password: "bind(vm#input.windows-password)"
+    endpoints:
+      "*": bind(vm#result.*)
+  bindings:
+    - [vm, zabbix]
+  components:
+    vm:
+      type: workflow.Instance
+      interfaces:
+        input:
+          image: 
+            type: configuration(map<string, object>)
+            suggestions:
+              "Win2008r2 (us-west-2) prepared": { ami: "us-east-1/ami-31620c54", user: "Administrator", type: "windows", hw: "m3.large"  }
+              "CentOS 6.5 (us-west-2) prepared": { ami: "us-east-1/ami-8997afe0", user: "root", type: "linux", hw: "m1.small" }
+          windows-password: { type: configuration(string), name: "Windows administrator password" }
+          instance-prefix: { type: configuration(string), name: "AWS tag prefix" }
+          mirror: { type: configuration(string), name: "Cygwin installation binary URL" }
+          packages: { type: configuration(string), name: "Cygwin pacakages to install" }
+        zabbix:
+          api-connection: {type: consume-signal(object), name: Zabbix API connection}
+          init-agent: send-command(list<string> agent-hosts, string identity => list<string> agent-screens)
+          delete-agent: send-command(list<string> agent-hosts)
+        result:
+          host-ips: 
+            type: publish-signal(list<string>)
+            name: Host IP
+          agent-screens:
+            type: publish-signal(list<string>)
+            name: Agent Sreens
+      required: [ zabbix ]
+      configuration:
+        input.mirror: "http://adp-repo.s3-website-us-east-1.amazonaws.com/cygwin"
+        input.packages: "openssh,curl,util-linux,procps,wget,unzip"
+        configuration.workflows:
+          launch:
+            steps:
+              - launch-vm:
+                  action: provisionVms
+                  parameters:
+                    hardwareId: "{$.image.hw}"
+                    imageId: "{$.image.ami}"
+                    vmIdentity: "{$.image.user}"
+                    jcloudsNodeNamePrefix: "{$.instance-prefix}"
+                    targetQuantity: 1
+                    roleName: "{$.image.type}"
+                    connectTimeout: 20 minutes
+                    providerSettings:
+                      userData:
+                        |
+                          <powershell>
+                              If (Test-Path "C:\cygwin64\bin\bash.exe") {{
+                                    C:\cygwin64\bin\bash.exe --login -c "mkgroup -l > /etc/group"
+                                    C:\cygwin64\bin\bash.exe --login -c "mkpasswd -l > /etc/passwd"
+                              }} Else {{
+
+                                    (New-Object System.Net.WebClient).DownloadFile("http://cygwin.com/setup-x86_64.exe", "setup-x86_64.exe")
+
+                                    .\setup-x86_64.exe --no-desktop --site '{$.mirror}' --quiet-mode --local-package-dir C:\cygwin64\local_packages --packages '{$.packages}' | Out-Null
+
+                                    C:\cygwin64\bin\bash.exe --login -c "cp /usr/bin/ps.exe /usr/bin/ps.exe~; cp /bin/ps.exe /bin/ps.exe~; cp /usr/bin/procps.exe /usr/bin/ps.exe; cp /usr/bin/procps.exe /bin/ps.exe"
+
+                                    # nearly 13.12.14 ssh-host-config bug was introduced in cygwin
+                                    # 1. root and Administrators groups are duplicated in /etc/group after installation
+                                    # 2. first ssh-host-config run fails because created cyg_server missing in /etc/passwd
+                                    # 3. sshd windows service has wrong user because of #2
+                                    Add-Type -Assembly System.Web
+                                    $$cyg_server_password_length = 15
+                                    $$cyg_server_password_non_alphanum = 5
+                                    $$cyg_server_password = [System.Web.Security.Membership]::GeneratePassword($$cyg_server_password_length, $$cyg_server_password_non_alphanum)
+                                    C:\cygwin64\bin\bash.exe --login -c "mkgroup > /etc/group"
+                                    C:\cygwin64\bin\bash.exe --login -c "ssh-host-config --yes --user cyg_server --pwd '$$cyg_server_password'"
+                                    C:\cygwin64\bin\bash.exe --login -c "mkpasswd > /etc/passwd"
+                                    C:\cygwin64\bin\bash.exe --login -c "cygrunsrv -R sshd"
+                                    C:\cygwin64\bin\bash.exe --login -c "ssh-host-config --yes --user cyg_server --pwd '$$cyg_server_password'"
+
+                                    # sshd 6.7 is too restrictive, reverting to 6.6 defaults
+                                    C:\cygwin64\bin\bash.exe --login -c "echo Ciphers aes128-ctr,aes192-ctr,aes256-ctr,arcfour256,arcfour128,aes128-cbc,3des-cbc,blowfish-cbc,cast128-cbc,aes192-cbc,aes256-cbc,arcfour >> /etc/sshd_config"
+                                    C:\cygwin64\bin\bash.exe --login -c "echo MACs hmac-md5,hmac-sha1,hmac-ripemd160,hmac-sha1-96,hmac-md5-96 >> /etc/sshd_config"
+                                    C:\cygwin64\bin\bash.exe --login -c "echo KexAlgorithms curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1 >> /etc/sshd_config"
+
+                                    netsh advfirewall firewall add rule name="CYGWIN sshd" dir=in action=allow program="C:\cygwin64\usr\sbin\sshd.exe" enable=yes
+                              }}
+                              C:\cygwin64\bin\bash.exe --login -c "mkdir -p ~/.undeploy.me"
+
+                              echo @'
+                              param(
+                              [string]$$chef_build = "10"  # 10.32.2-3 and 11.16.4-1 currently supported
+                              )
+                              # detect platform default and use ours
+                              if ($$chef_build -eq "10" -or $$chef_build -eq "10.16.2") {{
+                                  $$chef_build = "10.32.2-3"
+                              }} elseif ($$chef_build -eq "11") {{
+                                  $$chef_build = "11.16.4-1"
+                              }}
+                              If ((Test-Path "C:/opscode/chef/bin/chef-solo") -or ($$chefVersion -eq "")) {{
+                                  Write-Host "Chef already installed or chef build not specified, skipping installation..."
+                              }} Else {{
+                                  cd C:\
+                                  $$chef_version = $$chef_build.Split("-")[0]
+                                  $$chef_major_version = $$chef_build.Split(".")[0]
+                                  C:\cygwin64\bin\curl.exe -O "https://opscode-omnibus-packages.s3.amazonaws.com/windows/2008r2/x86_64/chef-windows-$${{chef_build}}.windows.msi"
+                                  Start-Process -FilePath msiexec -ArgumentList /i, "C:\chef-windows-$${{chef_build}}.windows.msi", /quiet, /qn -Wait
+                                  # supply chef original tar
+                                  C:/cygwin64/bin/sed -i "s|tar zxvf|C:/opscode/chef/bin/tar zxvf|"  C:/opscode/chef/embedded/lib/ruby/gems/1.9.1/gems/chef-$${{chef_version}}-x86-mingw32/lib/chef/application/solo.rb
+                                  if ($$chef_major_version -eq "11") {{
+                                      # fix chef bug
+                                      C:/cygwin64/bin/sed -i "s/status.exitstatus/0/g"                   C:/opscode/chef/embedded/lib/ruby/gems/1.9.1/gems/chef-$${{chef_version}}-x86-mingw32/lib/chef/mixin/command.rb
+                                  }}
+                                  C:\cygwin64\bin\bash.exe --login -c "mkdir ~/bin"
+                                  C:\cygwin64\bin\bash.exe --login -c "cat > ~/bin/shef <<'EEND'
+                          #!/usr/bin/bash --login
+                          /cygdrive/c/opscode/chef/embedded/bin/ruby.exe C:/opscode/chef/bin/shef `$$*
+                          EEND
+                          chmod +x ~/bin/shef
+                          "
+                                  C:\cygwin64\bin\bash.exe --login -c "cat > ~/bin/chef-client <<'EEND'
+                          #!/usr/bin/bash --login
+                          /cygdrive/c/opscode/chef/embedded/bin/ruby.exe C:/opscode/chef/bin/chef-client `$$*
+                          EEND
+                          chmod +x ~/bin/chef-client
+                          "
+                                  C:\cygwin64\bin\bash.exe --login -c "cat > ~/bin/chef-solo <<'EEND'
+                          #!/usr/bin/bash --login
+                          CONFIG_PATH=
+                          OTHER_ARGS=
+                          while [ \`"x`$$1\`" != x ]; do
+                              if [ \`"`$$1\`" == -c ]; then
+                                  shift;
+                                  CONFIG_PATH=\`"`$$1\`"
+                                  shift;
+                              else
+                                  OTHER_ARGS=\`"`$$OTHER_ARGS `$$1\`"
+                                  shift;
+                              fi
+                          done
+                          FILE_CACHE=`$$(grep file_cache_path `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/\x22(.*)\x22/\1/')
+                          COOKBOOKS=`$$(grep cookbook_path `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          QUBELL_COOKBOOKS=`$$(grep cookbook_path `$$CONFIG_PATH | awk '{{print `$$3}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          ROLES=`$$(grep role_path `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          DATA_BAGS=`$$(grep data_bag_path `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          NODE_PATH=`$$(grep node_path `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          NODE_NAME=`$$(grep node_name `$$CONFIG_PATH | awk '{{print `$$2}}' | sed -re 's/.*\x22(.*)\x22.*/\1/')
+                          NEW_ROOT=`$$(mktemp -d)
+                          # platform homedir detection behaves wrong in some cases, so we should detect and fix it
+                          if echo `$$NODE_PATH | grep -E '^.?\.undeploy.me' >/dev/null 2>/dev/null; then
+                              ROOT_FIX=`$$(cygpath -m `$$HOME)/
+                              OLD_ROOT=`$$ROOT_FIX
+                          else
+                              ROOT_FIX=''
+                              OLD_ROOT=`$$FILE_CACHE
+                          fi
+                          pushd `$$OLD_ROOT
+                          icacls . /save access.txt
+                          icacls `$$(cygpath -m `$$NEW_ROOT) /restore access.txt
+                          popd
+                          cp -r `$$ROOT_FIX`$$COOKBOOKS `$$NEW_ROOT/cookbooks 2>/dev/null
+                          cp -r `$$ROOT_FIX`$$QUBELL_COOKBOOKS `$$NEW_ROOT/qubell_cookbooks 2>/dev/null
+                          cp -r `$$ROOT_FIX`$$DATA_BAGS `$$NEW_ROOT/data_bags 2>/dev/null
+                          cp -r `$$ROOT_FIX`$$ROLES `$$NEW_ROOT/roles 2>/dev/null
+                          cd ~
+                          NODE_PATH_FIX=`$$(echo `$$NODE_PATH | cut -c 2-)
+                          mkdir -p `$$NODE_PATH_FIX
+                          chmod 0755 `$$NODE_PATH_FIX
+                          chmod 0755 `$$NODE_PATH_FIX/`$$NODE_NAME.json
+                          chmod 0755 `$$ROOT_FIX`$$NODE_PATH_FIX
+                          chmod 0755 `$$ROOT_FIX`$$NODE_PATH_FIX/`$$NODE_NAME.json
+                          cat `$$CONFIG_PATH | sed -re \`"s|`$$COOKBOOKS|`$$(cygpath -m `$$NEW_ROOT/cookbooks)|;s|`$$QUBELL_COOKBOOKS|`$$(cygpath -m `$$NEW_ROOT/qubell_cookbooks)|;s|`$$DATA_BAGS|`$$(cygpath -m `$$NEW_ROOT/data_bags)|;s|`$$ROLES|`$$(cygpath -m `$$NEW_ROOT/roles)|;s|`$$NODE_PATH|`$$ROOT_FIX`$$NODE_PATH_FIX|;s|\x22`$$FILE_CACHE\x22|\x22`$$(cygpath -m `$$NEW_ROOT)\x22|;\`" > `$$NEW_ROOT/client.rb
+
+                          /cygdrive/c/opscode/chef/embedded/bin/ruby.exe C:/opscode/chef/bin/chef-solo -c `$$(cygpath -m `$$NEW_ROOT/client.rb) `$$OTHER_ARGS
+                          EEND
+                          chmod +x ~/bin/chef-solo
+                          "
+                                  C:\cygwin64\bin\bash.exe --login -c "cat > ~/.bashrc <<'EEND'
+                          export LC_ALL=C
+                          export LANG=C
+                          export PATH=~/bin:`$$PATH
+                          EEND
+                          "
+                              }}
+                          '@ | Out-File $$(C:\cygwin64\bin\bash.exe --login -c "cygpath -w ~/.undeploy.me/chef-install.ps1")
+                              C:\cygwin64\bin\bash.exe --login -c "mkdir -p ~/.ssh"
+                              $$drive = (Get-Volume -FileSystemLabel config-2 | % {{ $$_.DriveLetter }})
+                              If (Test-Path "$${{drive}}:\openstack\") {{
+                                  C:\cygwin64\bin\bash.exe --login -c "grep ssh-rsa `$$(find `$$(find /cygdrive -maxdepth 2 -name openstack -or -name ec2) -name 'meta?data.json') | sed -re 's/.*(ssh-rsa [a-zA-Z0-9+/=]+).*/\1/' | uniq >> ~/.ssh/authorized_keys"
+                              }} Else {{
+                                  C:\cygwin64\bin\bash.exe --login -c "curl --connect-timeout 5 169.254.169.254/latest/meta-data/public-keys/0/openssh-key > ~/.ssh/authorized_keys"
+                              }}
+                              C:\cygwin64\bin\bash.exe --login -c "chmod 0700 ~/.ssh; chmod 0600 ~/.ssh/authorized_keys"
+                              net start sshd
+                          </powershell>
+                  output:
+                    ips: ips
+                    
+              - change-admin-password:
+                  action: execrun
+                  phase: service
+                  precedingPhases: [launch-vm]
+                  parameters:
+                    roles: [ windows ]
+                    isSudo: false
+                    command:
+                      - "NET USER ADMINISTRATOR {$.windows-password}"
+              - init-agent:
+                  action: zabbix.init-agent
+                  precedingPhases: [ change-admin-password ]
+                  parameters:
+                    commandCallTimeout: 180 minutes
+                    agent-hosts: "{$.ips}"
+                    identity: "{$.image.user}"
+                  output:
+                    agent-screens: agent-screens
+            return:
+              host-ips:
+                value: "{$.ips}"
+              agent-screens:
+                value: "{$.agent-screens}"
+                
+          destroy:
+            steps:
+              - delete-agent:
+                  action: zabbix.delete-agent
+                  parameters:
+                    commandCallTimeout: 180 minutes
+                    agent-hosts: "{$.host-ips}"
+  
+    zabbix:
+      type: reference.Submodule
+      configuration:
+        __locator.application-id: "Zabbix Server"
+      interfaces:
+        zabbix:
+          api-connection: {type: publish-signal(object), name: Zabbix API connection}
+          init-agent: receive-command(list<string> agent-hosts, string identity => list<string> agent-screens)
+          delete-agent: receive-command(list<string> agent-hosts)
