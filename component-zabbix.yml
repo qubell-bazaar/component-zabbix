@@ -1,6 +1,6 @@
 application:
   configuration:
-    input.recipe-url: "https://s3.amazonaws.com/qubell-starter-kit-artifacts/qubell-bazaar/component-zabbix-cookbooks-stable-241b83a.tar.gz"
+    input.recipe-url: "https://s3.amazonaws.com/qubell-starter-kit-artifacts/qubell-bazaar/component-zabbix-cookbooks-stable-38ec98e.tar.gz"
     input.image: { "ami": "us-east-1/ami-8997afe0", "user": "root", "type": "linux", "hw": "m1.small" }
     input.image-prefix: "Zabbix"
     input.web-credentials: { "login": "admin", "password": "zabbix001"}
