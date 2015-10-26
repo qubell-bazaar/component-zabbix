@@ -1,0 +1,328 @@
+application:
+  configuration:
+    input.recipe-url: "https://s3.amazonaws.com/qubell-starter-kit-artifacts/qubell-bazaar/component-zabbix-cookbooks-stable-241b83a.tar.gz"
+    input.image: { "ami": "us-east-1/ami-8997afe0", "user": "root", "type": "linux", "hw": "m1.small" }
+    input.image-prefix: "Zabbix"
+    input.web-credentials: { "login": "admin", "password": "zabbix001"}
+  bindings:
+    - [zabbix, database]
+  interfaces:
+    input:
+      recipe-url: bind(zabbix#input.recipe-url)
+      image: bind(zabbix#input.image)
+      image-prefix: bind(zabbix#input.image-prefix)
+      web-credentials: bind(zabbix#input.web-credentials)
+    app-meta:
+      application-pic: "bind(metadata#output.application-pic)"
+    zabbix:
+      host: bind(zabbix#result.zabbix-host)
+      web-ui: bind(zabbix#result.zabbix-UI)
+      web-ui-user: bind(zabbix#result.zabbix-ui-user)
+      web-ui-password: bind(zabbix#result.zabbix-ui-password)
+      api-connection: bind(zabbix#result.zabbix-con)
+      api: "bind(zabbix#actions.api-command)"
+      init-agent: "bind(zabbix#actions.init-agent)"
+      delete-agent: "bind(zabbix#actions.delete-agent)"
+  components:
+    metadata:
+      type: cobalt.common.Constants
+      interfaces:
+        output:
+          application-pic:
+            type: publish-signal(map<string, object>)
+            name: ""
+      configuration:
+        configuration.values:
+          output.application-pic:
+            large: "https://s3.amazonaws.com/qubell-images/zabbix-logo.png"
+            small: "https://s3.amazonaws.com/qubell-images/zabbix-small.png"
+            small-height: 48
+    zabbix:
+      type: workflow.Instance
+      interfaces:
+        input:
+          image: configuration(map<string, object>)
+          image-prefix: configuration(string)
+          recipe-url: configuration(string)
+          web-credentials: configuration(map<string, object>)
+        mysql:
+          dbms:
+            type: consume-signal(object)
+          db-host:
+              type: consume-signal(string)
+          db-port:
+              type: consume-signal(int)
+          schema:
+              type: send-command(string db-user, string db-user-password, list<string> db-user-privileges => object connection)
+          file-query:
+              type: send-command(object connection, list<string> sql-url)
+        actions:
+          api-command:
+            type: receive-command(object connection, string method, object api-params)
+            name: Run API command
+            arguments:
+              connection:
+                name: Server API connection
+              method:
+                name: API methods
+              api-params:
+                name: API call parameters
+          init-agent:
+            type: receive-command(list<string> agent-hosts, string identity => list<string> agent-screens)
+            name: Initialize agent host
+            arguments:
+              agent-hosts:
+                name: Hosts IPs to setup zabbix agent
+              identity:
+                name: User to zabbix agent hosts
+          delete-agent:
+            type: receive-command(list<string> agent-hosts)
+            name: Delete hosts from monitoring
+            arguments:
+              agent-hosts:
+                name: Zabbix agents IP for deletion
+        result:
+          zabbix-host:
+            type: publish-signal(string)
+            name: Zabbix Host
+          zabbix-UI:
+            type: publish-signal(string)
+            name: Zabbix UI
+          zabbix-ui-user:
+            type: publish-signal(string)
+            name: Zabbix Web user
+          zabbix-ui-password:
+            type: publish-signal(string)
+            name: Zabbix Web user password
+          zabbix-con:
+            type: publish-signal(object)
+            name: Zabbix API connection
+      required: [ mysql ]
+      configuration:
+        configuration.workflows:
+          launch:
+            steps:
+              - get-env-props:
+                  action: getEnvironmentProperties
+                  phase: get-env-props
+                  output:
+                    props: result
+              - provision:
+                  action: provisionVms
+                  parameters:
+                    hardwareId: "{$.image.hw}"
+                    imageId: "{$.image.ami}"
+                    vmIdentity: "{$.image.user}"
+                    jcloudsNodeNamePrefix: "{$.image-prefix}"
+                    roleName: default
+                  output:
+                    ips: ips
+              - hostname: 
+                  action: execrun
+                  precedingPhases: [ provision ]
+                  parameters:
+                    roles: [ default ]
+                    command:
+                      - bash
+                      - "-c"
+                      - |
+                        hostname `curl -s http://169.254.169.254/latest/meta-data/public-hostname` &&
+                        echo "`hostname -i`   `hostname` `hostname -s`" >> /etc/hosts &&
+                        hostname
+                  output:
+                    dns: stdout
+              - generate-db-password:
+                  action: execrun
+                  precedingPhases: [ provision ]
+                  parameters:
+                    roles: [ default ]
+                    command:
+                      - openssl rand -hex 10
+                  output:
+                    pwout: stdout
+              - manage-schema:
+                  action: mysql.schema
+                  precedingPhases: [ generate-db-password , hostname ]
+                  parameters:
+                    commandCallTimeout: 5 minutes
+                    db-user: "zabbix"
+                    db-user-password: "{$.pwout[*][0]}"
+                    db-user-privileges: ["all"]
+                  output:
+                    con: connection
+              - populate-db:
+                  action: mysql.file-query
+                  precedingPhases: [ manage-schema ]
+                  parameters:
+                    commandCallTimeout: 5 minutes
+                    connection: "{$.con}"
+                    sql-url: ["https://dl.dropboxusercontent.com/u/250836/zabbix-mysql/schema.sql", "https://dl.dropboxusercontent.com/u/250836/zabbix-mysql/images.sql", "https://dl.dropboxusercontent.com/u/250836/zabbix-mysql/data.sql"]
+              - install-zabbix:
+                  action: chefsolo
+                  precedingPhases: [ manage-schema ]
+                  parameters:
+                    version: "11.16.4"
+                    roles: [ default ]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell-zabbix]" ]
+                    jattrs:
+                      mysql:
+                        server_root_password: "{$.props.mysql.dbms.db-root-password}"
+                      zabbix:
+                        server:
+                          version: "2.2.9"
+                          install_method: "source"
+                        database:
+                          dbhost: "{$.con.db-host}"
+                          dbname: "{$.con.db-name}"
+                          dbuser: "{$.con.db-user}"
+                          dbpassword: "{$.con.db-user-password}"
+                        web:
+                          install: true
+                          install_method: "nginx"
+                          fqdn: "{$.dns[*][0]}"
+                          login: "{$.web-credentials.login}"
+                          password: "{$.web-credentials.password}"
+                        agent:
+                          servers: "{$.dns[*][0]}"
+              - set-admin-password:
+                  action: api-command
+                  precedingPhases: [ install-zabbix ]
+                  parameters:
+                    connection: { url: "http://{$.dns[*][0]}/api_jsonrpc.php", user: "admin", password: "zabbix" }
+                    method: "user.update"
+                    api-params: {"userid": "1", "passwd": "{$.web-credentials.password}"}
+
+            return:
+              zabbix-host:
+                value: "{$.dns[*][0]}"
+              zabbix-UI:
+                value: "http://{$.dns[*][0]}"
+              zabbix-ui-user:
+                value: "{$.web-credentials.login}"
+              zabbix-ui-password:
+                value: "{$.web-credentials.password}"
+              zabbix-con:
+                value: { url: "http://{$.dns[*][0]}/api_jsonrpc.php", user: "{$.web-credentials.login}", password: "{$.web-credentials.password}" }
+
+          api-command:
+            steps:
+              - run-api-command:
+                  action: chefsolo
+                  parameters:
+                    version: "11.16.4"
+                    roles: [ default ]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: ["recipe[qubell-zabbix::api]"]
+                    jattrs:
+                      zabbix:
+                        server_connection: "{$.connection}"
+                        method: "{$.method}"
+                        parameters: "{$.api-params}"
+
+          init-agent:
+            steps:
+              - provision:
+                  action: provisionVms
+                  parameters:
+                    hardwareId: ""
+                    vmIdentity: "{$.identity}"
+                    staticIps: "{$.agent-hosts}"
+                    roleName: zabbix-agent
+                  output:
+                    ips: ips
+              - install-zabbix-agent:
+                  action: chefsolo
+                  precedingPhases: [ provision ]
+                  parameters:
+                    isSudo: false
+                    version: "11.16.4-1"
+                    roles: [zabbix-agent]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell-zabbix::agent]" ]
+                    jattrs:
+                      zabbix:
+                        agent:
+                          version: "2.2.9"
+                          install: "true"
+                          servers: ["{$.zabbix-host}"]
+              - agent-registration:
+                  action: chefsolo
+                  precedingPhases: [install-zabbix-agent]
+                  parameters:
+                    isSudo: false
+                    version: "11.16.4-1"
+                    roles: [zabbix-agent]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell-zabbix::manage_host]" ]
+                    jattrs:
+                      qubell-zabbix:
+                        host_action: "create"
+                      zabbix:
+                        agent:
+                          hostname: "{$.ips}"
+                        connection: "{$.zabbix-con}"
+              - create-screen:
+                  action: chefsolo
+                  precedingPhases: [agent-registration]
+                  parameters:
+                    isSudo: false
+                    version: "11.16.4-1"
+                    roles: [default]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: [ "recipe[qubell-zabbix::create_screen]", "recipe[qubell-zabbix::update_group]" ]
+                    jattrs:
+                      zabbix:
+                        agent:
+                          hostname: "{$.ips}"
+                        connection: "{$.zabbix-con}"
+                  output:
+                    agent-attrs: chefState
+            return:
+              agent-screens:
+                value: "{$.zabbix-UI}/screens.php?sid=8a9398734b4b6210&form_refresh=1&fullscreen=0&elementid={$.agent-attrs['*'].zabbix.agent.screenid}"
+
+          delete-agent:
+            steps:
+              - delete-agent:
+                  action: chefsolo
+                  parameters:
+                    roles: [ default ]
+                    recipeUrl: "{$.recipe-url}"
+                    runList: ["recipe[qubell-zabbix::manage_host]"]
+                    jattrs:
+                      qubell-zabbix:
+                        host_action: "delete"
+                      zabbix:
+                        agent: 
+                          hostname: "{$.agent-hosts}"
+                        connection: "{$.zabbix-con}"
+
+    database:
+      type: reference.Submodule
+      configuration:
+        __locator.application-id: "Database"
+      interfaces:
+        input:
+          db-port:
+              type: configuration(int)
+              name: Database port
+          db-root-password:
+              type: configuration(string)
+              name: Database root password
+        mysql:
+          schema:
+              type: receive-command(string db-user, string db-user-password, list<string> db-user-privileges => object connection)
+              name: Manage schema
+          file-query:
+              type: receive-command(list<string> sql-url, object connection)
+              name: Run a SQL query
+          dbms:
+              type: publish-signal(object)
+              name: Database parameters
+          db-host:
+              type: publish-signal(string)
+              name: Database host
+          db-port:
+              type: publish-signal(int)
+              name: Database port

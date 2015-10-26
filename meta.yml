@@ -1,0 +1,19 @@
+kit:
+  name: "Zabbix Server"
+  link: https://github.com/qubell-bazaar/component-zabbix
+  applications:
+    - name: "Zabbix Server"
+      manifest: "https://raw.github.com/qubell-bazaar/component-zabbix/1.0-43p/component-zabbix.yml"
+    - name: "Database"
+      manifest: "https://raw.github.com/qubell-bazaar/component-mysql-dev/1.2-43p/component-mysql-dev.yml"
+    - name: "Zabbix Agent App"
+      manifest: "https://raw.github.com/qubell-bazaar/component-zabbix/1.0-43p/zabbix-agent-app.yml"
+  provider:
+    name: "Qubell"
+    link: http://qubell.com
+  documentation:
+    overview: |
+      This application requires the following items to be configured in your environment:
+        * CloudServers account;
+        * Ports 80, 3306, 10050, 10051 open on the ﬁrewall.
+      Please refer to the Getting Started for step-by-step instructions on how to configure your environment.
